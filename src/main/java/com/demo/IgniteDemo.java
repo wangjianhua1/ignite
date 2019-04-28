@@ -1,27 +1,45 @@
 package com.demo;
 
-import org.apache.ignite.Ignite;
-import org.apache.ignite.IgniteCache;
-import org.apache.ignite.IgniteCluster;
-import org.apache.ignite.Ignition;
+import com.demo.entity.City;
+import org.apache.ignite.*;
+import org.apache.ignite.cache.query.FieldsQueryCursor;
+import org.apache.ignite.cache.query.SqlFieldsQuery;
+import org.apache.ignite.cluster.ClusterGroup;
+import org.apache.ignite.cluster.ClusterMetrics;
+import org.apache.ignite.cluster.ClusterNode;
+import org.apache.ignite.configuration.IgniteConfiguration;
+import org.apache.ignite.lang.IgniteCallable;
+import org.apache.ignite.spi.communication.tcp.TcpCommunicationSpi;
+import org.apache.ignite.spi.discovery.tcp.TcpDiscoverySpi;
+import org.apache.ignite.spi.discovery.tcp.ipfinder.vm.TcpDiscoveryVmIpFinder;
+import org.apache.ignite.transactions.Transaction;
+import org.junit.Test;
 
 import java.sql.*;
+import java.util.*;
+import java.util.concurrent.locks.Lock;
 
 public class IgniteDemo {
 
     public static void main(String[] args) throws SQLException {
-        Connection conn = getConn();
-//        initTable(conn);
-//        initData(conn);
-        selectPerson(conn);
-        conn.close();
+        Connection conn = new IgniteDemo().getConn();
+////        initTable(conn);
+////        initData(conn);
+////        selectPerson(conn);
+////        queryCacheCity();
+////        conn.close();
+////        compute();
+////        cache();
+//        opAbsent();
+//
     }
 
     /**
      * 获取ignite连接，默认10800端口
+     *
      * @return
      */
-    public static Connection getConn() {
+    public Connection getConn() {
         try {
             Class.forName("org.apache.ignite.IgniteJdbcThinDriver");
             return DriverManager.getConnection("jdbc:ignite:thin://127.0.0.1/");
@@ -35,10 +53,10 @@ public class IgniteDemo {
 
     /**
      * 初始化表结构
-     *
-     * @param conn
      */
-    public static void initTable(Connection conn) {
+    @Test
+    public void initTable() {
+        Connection conn = getConn();
         try (Statement stmt = conn.createStatement()) {
             // 创建基于复制模式的City表
             stmt.executeUpdate("CREATE TABLE City (id LONG PRIMARY KEY, name VARCHAR) WITH \"template=replicated\"");
@@ -55,10 +73,10 @@ public class IgniteDemo {
 
     /**
      * 初始化表数据
-     *
-     * @param conn
      */
-    public static void initData(Connection conn) {
+    @Test
+    public void initData() {
+        Connection conn = getConn();
         // Populate City table
         try (PreparedStatement stmt = conn.prepareStatement("INSERT INTO City (id, name) VALUES (?, ?)")) {
             stmt.setLong(1, 1L);
@@ -98,10 +116,10 @@ public class IgniteDemo {
 
     /**
      * 测试查询Person表数据
-     *
-     * @param conn
      */
-    public static void selectPerson(Connection conn) {
+    @Test
+    public void selectPerson() {
+        Connection conn = getConn();
         // 使用标准的sql获取数据
         try (Statement stmt = conn.createStatement()) {
             try (ResultSet rs = stmt.executeQuery("SELECT p.name, c.name FROM Person p, City c WHERE p.city_id = c.id")) {
@@ -114,68 +132,187 @@ public class IgniteDemo {
         }
     }
 
+    /**
+     * 作为数据网格应用
+     */
+    @Test
+    public void cache() {
+        try (Ignite ignite = Ignition.start()) {
+            IgniteCache<Integer, String> cache = ignite.getOrCreateCache("myCacheName");
 
-    public static void compute() {
-        //连接集群
+            // Store keys in cache (values will end up on different cache nodes).
+            for (int i = 0; i < 10; i++)
+                cache.put(i, Integer.toString(i));
+
+            for (int i = 0; i < 10; i++)
+                System.out.println("Got [key=" + i + ", val=" + cache.get(i) + ']');
+        }
+    }
+
+    @Test
+    public void queryCacheCity() {
         Ignite ignite = Ignition.start();
         IgniteCache<Long, City> cityCache = ignite.cache("SQL_PUBLIC_CITY");
+        SqlFieldsQuery query = new SqlFieldsQuery("select p.name,c.name from Person p,City c where p.city_id=c.id");
+
+        FieldsQueryCursor<List<?>> cursor = cityCache.query(query);
+
+        Iterator<List<?>> iterator = cursor.iterator();
+        while (iterator.hasNext()) {
+            List<?> row = iterator.next();
+            System.out.println(row.get(0) + ", " + row.get(1));
+        }
+    }
+
+    /**
+     * 原子操作
+     */
+    @Test
+    public void opAbsent() {
+        Ignite ignite = Ignition.start();
+        Collection<String> cacheNames = ignite.cacheNames();
+        System.out.println(cacheNames);
+        IgniteCache<String, Integer> cache = ignite.getOrCreateCache("myCacheName");
+        // Put-if-absent which returns previous value.
+        Integer oldVal = cache.getAndPutIfAbsent("Hello", 11);
+
+        // Put-if-absent which returns boolean success flag.
+        boolean success = cache.putIfAbsent("World", 22);
+
+        // Replace-if-exists operation (opposite of getAndPutIfAbsent), returns previous value.
+        oldVal = cache.getAndReplace("Hello", 12);
+
+        // Replace-if-exists operation (opposite of putIfAbsent), returns boolean success flag.
+        success = cache.replace("World", 23);
+
+        // Replace-if-matches operation.
+        success = cache.replace("World", 2, 22);
+
+        // Remove-if-matches operation.
+        success = cache.remove("Hello", 1);
+        Integer hello = cache.get("Hello");
+        Integer world = cache.get("World");
+        System.out.println(hello + "==" + world);
 
     }
-    
-    public static void cluster(){
-        Ignite ignite =Ignition.start();
+
+    /**
+     * 事物操作
+     */
+    @Test
+    public void transaction() {
+        Ignite ignite = Ignition.start();
+        IgniteCache<String, Integer> cache = ignite.getOrCreateCache("myCacheName");
+        try (Transaction tx = ignite.transactions().txStart()) {
+            Integer hello = cache.get("Hello");
+
+            if (hello == 1) {
+                cache.put("Hello", 111);
+            } else {
+                cache.put("World", 22);
+            }
+            tx.commit();
+        }
+    }
+
+    /**
+     * 分布式锁
+     */
+    @Test
+    public void lock() {
+        Ignite ignite = Ignition.start();
+        IgniteCache<String, Integer> cache = ignite.getOrCreateCache("myCacheName");
+        Lock lock = cache.lock("Hello");
+        lock.lock();
+        try {
+            cache.put("Hello", 1111);
+            cache.put("World", 2222);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Test
+    public void compute() {
+        //连接集群
+        Ignite ignite = Ignition.start();//启动节点
+        Collection<IgniteCallable<Integer>> calls = new ArrayList<>();
+        //空格分组并将任务计算分派到各个节点计算
+        for (final String word : "Count characters using callable".split(" ")) {
+            calls.add(word::length);
+        }
+        //分派
+        Collection<Integer> res = ignite.compute().call(calls);
+        //计算结果汇总
+        int sum = res.stream().mapToInt(Integer::intValue).sum();
+        System.out.println("Total number of characters is :" + sum);
+
+    }
+
+
+    /**
+     * 使用编程方式连接集群
+     *
+     * @return
+     */
+    public static Ignite getIgnite() {
+        TcpDiscoverySpi spi = new TcpDiscoverySpi();
+        TcpDiscoveryVmIpFinder ipFinder = new TcpDiscoveryVmIpFinder();
+        ipFinder.setAddresses(Arrays.asList("127.0.0.1:47500..47501"));
+        spi.setIpFinder(ipFinder);
+        IgniteConfiguration cfg = new IgniteConfiguration();
+        cfg.setDiscoverySpi(spi);
+        cfg.setClientMode(true);//客户端或服务端开关
+        return Ignition.start(cfg);
+    }
+
+    public static Ignite CommunicationSpi() {
+        TcpCommunicationSpi spi = new TcpCommunicationSpi();
+        TcpDiscoveryVmIpFinder ipFinder = new TcpDiscoveryVmIpFinder();
+        ipFinder.setAddresses(Arrays.asList("127.0.0.1:47500..47501"));
+        spi.setSlowClientQueueLimit(1000);//设置队列限制值
+        IgniteConfiguration cfg = new IgniteConfiguration();
+        cfg.setCommunicationSpi(spi);
+        cfg.setClientMode(true);//客户端或服务端开关
+        return Ignition.start(cfg);
+    }
+
+    /**
+     * 服务端节点执行
+     * 本地节点执行
+     */
+    @Test
+    public void client_cluster() {
+        Ignite ignite = Ignition.start("E:\\apache-ignite-2.7.0-bin\\config\\default-config.xml");
+//        Ignite ignite = Ignition.ignite();
+        ClusterGroup clusterGroup = ignite.cluster().forClients();
+        IgniteCompute compute = ignite.compute(clusterGroup);
+        compute.broadcast(() -> System.out.println("hello client"));
+    }
+
+    /**
+     * 服务端节点执行
+     * 只把作业广播到远程节点执行(除了本地节点)
+     */
+    @Test
+    public void server_cluster() {
+        Ignite ignite = getIgnite();
+//        Ignite ignite = Ignition.ignite();
+        IgniteCompute compute = ignite.compute();
+        // Local Ignite node.
         IgniteCluster cluster = ignite.cluster();
+        ClusterNode localNode = cluster.localNode();
+        // Node metrics.
+        ClusterMetrics metrics = localNode.metrics();
+        // Get some metric values.
+        double cpuLoad = metrics.getCurrentCpuLoad();
+        long usedHeap = metrics.getHeapMemoryUsed();
+        int numberOfCores = metrics.getTotalCpus();
+        int activeJobs = metrics.getCurrentActiveJobs();
+        compute.broadcast(() -> System.out.println("节点Id: " + ignite.cluster().localNode().id()));
     }
+
 
 }
 
-class City {
-    private Long id;
-    private String name;
 
-    public Long getId() {
-        return id;
-    }
-
-    public void setId(Long id) {
-        this.id = id;
-    }
-
-    public String getName() {
-        return name;
-    }
-
-    public void setName(String name) {
-        this.name = name;
-    }
-}
-
-class Person {
-    private Long id;
-    private String name;
-    private Long city_id;
-
-    public Long getId() {
-        return id;
-    }
-
-    public void setId(Long id) {
-        this.id = id;
-    }
-
-    public String getName() {
-        return name;
-    }
-
-    public void setName(String name) {
-        this.name = name;
-    }
-
-    public Long getCity_id() {
-        return city_id;
-    }
-
-    public void setCity_id(Long city_id) {
-        this.city_id = city_id;
-    }
-}
